@@ -1,0 +1,16 @@
+[build-system]
+requires = ["flit_core>=3.4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "check-pypi-metadata"
+version = "1.0.0"
+description = "Audit PyPI metadata for packages listed in requirements files"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Nicola Soranzo", email = "nicola.soranzo@earlham.ac.uk" }]
+requires-python = ">=3.10"
+dependencies = ["playwright>=1.40"]
+
+[project.scripts]
+check-pypi-metadata = "check_pypi_metadata:main"
