@@ -49,10 +49,12 @@ from typing import (
     TypedDict,
 )
 
+__version__ = "1.0.0"
+
 PYPI_JSON_URL = "https://pypi.org/pypi/{package}/json"
 PYPI_INTEGRITY_URL = "https://pypi.org/integrity/{package}/{version}/{filename}/provenance"
 PYPI_RELEASE_URL = "https://pypi.org/project/{package}/{version}/"
-USER_AGENT = "check_pypi_metadata/1.0"
+USER_AGENT = f"check_pypi_metadata/{__version__} (https://github.com/nsoranzo/check-pypi-metadata)"
 
 # Default browser executable candidates for Playwright-based scraping
 _DEFAULT_BROWSER_CANDIDATES = [
