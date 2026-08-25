@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 For each package listed in one or more requirements files, query PyPI to collect
 metadata about the latest release:
@@ -45,9 +44,12 @@ from concurrent.futures import (
 from pathlib import Path
 from typing import (
     Any,
-    Optional,
     TypedDict,
+    TYPE_CHECKING,
 )
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 __version__ = "1.0.0"
 
@@ -78,14 +80,14 @@ _NORMALISE_NAME_RE = re.compile(r"[-_.]+")
 class Result(TypedDict):
     package: str
     notes: str
-    version: Optional[str]
-    trusted_publishing: Optional[bool]
-    has_provenance: Optional[bool]
+    version: str | None
+    trusted_publishing: bool | None
+    has_provenance: bool | None
     has_sdist: bool
-    tp_check_fn: Optional[str]
+    tp_check_fn: str | None
     has_wheels: bool
-    pure_python: Optional[bool]
-    has_freethreaded: Optional[bool]
+    pure_python: bool | None
+    has_freethreaded: bool | None
 
 
 def parse_requirements(files: list[Path]) -> list[str]:
@@ -108,7 +110,7 @@ def parse_requirements(files: list[Path]) -> list[str]:
     return sorted(packages)
 
 
-def _request(url: str, accept: Optional[str] = None, timeout: int = 15) -> bytes:
+def _request(url: str, accept: str | None = None, timeout: int = 15) -> bytes:
     headers = {"User-Agent": USER_AGENT}
     if accept:
         headers["Accept"] = accept
@@ -117,7 +119,7 @@ def _request(url: str, accept: Optional[str] = None, timeout: int = 15) -> bytes
         return resp.read()
 
 
-def get_pypi_info(package: str) -> Optional[dict[str, Any]]:
+def get_pypi_info(package: str) -> dict[str, Any] | None:
     """Return the parsed JSON from the PyPI JSON API, or None if not found."""
     url = PYPI_JSON_URL.format(package=package)
     try:
@@ -128,7 +130,7 @@ def get_pypi_info(package: str) -> Optional[dict[str, Any]]:
         raise
 
 
-def _wheel_tags(filename: str) -> Optional[tuple[list[str], str, str]]:
+def _wheel_tags(filename: str) -> tuple[list[str], str, str] | None:
     """
     Parse a wheel filename and return (python_tags, abi_tag, platform_tag).
     python_tags is a list (the tag may be composite, e.g. "cp39.cp310").
@@ -145,7 +147,7 @@ def _wheel_tags(filename: str) -> Optional[tuple[list[str], str, str]]:
     return python_tag.split("."), abi_tag, platform_tag
 
 
-def analyse_wheels(urls: list[dict[str, Any]]) -> tuple[bool, bool, Optional[bool], Optional[bool], str]:
+def analyse_wheels(urls: list[dict[str, Any]]) -> tuple[bool, bool, bool | None, bool | None, str]:
     """
     Given the list of file dicts from the PyPI JSON "urls" field, return:
       has_sdist        bool
@@ -200,7 +202,7 @@ def analyse_wheels(urls: list[dict[str, Any]]) -> tuple[bool, bool, Optional[boo
     return has_sdist, True, pure_python, has_freethreaded, ""
 
 
-def check_provenance(package: str, version: str, sdist_filename: str) -> tuple[bool, Optional[str]]:
+def check_provenance(package: str, version: str, sdist_filename: str) -> tuple[bool, str | None]:
     """
     Return (bool, error_str|None).
     True  = PEP 740 provenance object found (implies Trusted Publishing was used).
@@ -229,7 +231,7 @@ def check_provenance(package: str, version: str, sdist_filename: str) -> tuple[b
 _TP_RE = re.compile(r"Uploaded using Trusted Publishing\?\s*(Yes|No)", re.IGNORECASE)
 
 
-def _find_browser_executable(explicit_path: Optional[str]) -> Optional[str]:
+def _find_browser_executable(explicit_path: str | None) -> str | None:
     if explicit_path:
         return explicit_path
     for candidate in _DEFAULT_BROWSER_CANDIDATES:
@@ -238,12 +240,18 @@ def _find_browser_executable(explicit_path: Optional[str]) -> Optional[str]:
     return None
 
 
-def scrape_trusted_publishing(page: Any, package: str, version: str, tp_filename: str) -> Optional[bool]:
+class ScrapingError(Exception):
+    """Raised when HTML scraping fails to retrieve the expected content."""
+
+
+def scrape_trusted_publishing(page: "Page", package: str, version: str, tp_filename: str) -> bool:
     """
     Using an already-open Playwright *page*, navigate to the PyPI release page,
     locate the per-file section for *tp_filename* (an sdist or wheel filename),
-    and return True/False for "Uploaded using Trusted Publishing?", or None if
-    it cannot be determined.
+    and return True/False for "Uploaded using Trusted Publishing?".
+
+    Raises ScrapingError if the page content cannot be retrieved (e.g., due to
+    CAPTCHA challenges or other bot-detection mechanisms).
     """
     url = PYPI_RELEASE_URL.format(package=package, version=version)
     page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -264,13 +272,23 @@ def scrape_trusted_publishing(page: Any, package: str, version: str, tp_filename
             pass  # timeout is expected once analytics start; use whatever we have
     section_start = re.search(rf'id="{escaped}"', html)
     if not section_start:
-        return None
+        # Check if we're stuck on a CAPTCHA/bot-detection page
+        if "captcha" in html.lower() or "challenge" in html.lower():
+            raise ScrapingError(
+                f"PyPI served a CAPTCHA challenge page for {package}; "
+                "automated scraping is blocked"
+            )
+        raise ScrapingError(
+            f"could not find file section for '{tp_filename}' in PyPI page for {package}/{version}"
+        )
     # Take a generous slice after the section start (next ~2 KB is enough)
     snippet = html[section_start.start() : section_start.start() + 2048]
     m = _TP_RE.search(snippet)
     if m:
         return m.group(1).lower() == "yes"
-    return None
+    raise ScrapingError(
+        f"could not find 'Uploaded using Trusted Publishing?' text for {package}/{version}"
+    )
 
 
 def check_package(package: str) -> Result:
@@ -341,7 +359,7 @@ def check_package(package: str) -> Result:
 # ---------------------------------------------------------------------------
 
 
-def _tri(value: Optional[bool]) -> str:
+def _tri(value: bool | None) -> str:
     """Format a bool|None as yes/no/n/a."""
     if value is None:
         return "n/a"
@@ -382,7 +400,7 @@ def result_to_row(r: Result) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Query PyPI for packages listed in requirements files and report metadata "
@@ -442,9 +460,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {executor.submit(check_package, pkg): pkg for pkg in packages}
-        done = 0
-        for future in as_completed(futures):
-            done += 1
+        for done, future in enumerate(as_completed(futures), 1):
             print(f"\r  {done}/{total}", end="", file=sys.stderr, flush=True)
             r = future.result()
             results[r["package"]] = r
@@ -479,8 +495,25 @@ def main(argv: Optional[list[str]] = None) -> None:
                     file=sys.stderr,
                 )
                 with sync_playwright() as pw:
-                    browser = pw.chromium.launch(headless=True, executable_path=browser_path)
-                    page = browser.new_page()
+                    # Use stealth settings to avoid bot detection / CAPTCHA challenges
+                    browser = pw.chromium.launch(
+                        headless=True,
+                        executable_path=browser_path,
+                        args=["--disable-blink-features=AutomationControlled"],
+                    )
+                    context = browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                        ),
+                        viewport={"width": 1920, "height": 1080},
+                        locale="en-US",
+                    )
+                    page = context.new_page()
+                    # Remove navigator.webdriver to avoid detection
+                    page.add_init_script(
+                        'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
+                    )
                     # Block resources we don't need so pages load faster.
                     # Use fulfill (empty 200) rather than abort — aborting
                     # sub-resources can propagate net::ERR_ABORTED to the main
@@ -508,10 +541,11 @@ def main(argv: Optional[list[str]] = None) -> None:
                             tp = scrape_trusted_publishing(page, r["package"], version, tp_fn)
                             r["trusted_publishing"] = tp
                         except Exception as exc:
-                            print(
-                                f"\nWarning: scraping {r['package']} failed: {exc}",
-                                file=sys.stderr,
-                            )
+                            scrape_error = str(exc)
+                            if r["notes"]:
+                                r["notes"] += f"; {scrape_error}"
+                            else:
+                                r["notes"] = scrape_error
                     browser.close()
                 print(file=sys.stderr)
 
