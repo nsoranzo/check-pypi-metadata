@@ -14,21 +14,14 @@ metadata about the latest release:
         step (those packages will show "n/a").
   - has_provenance: whether the sdist has a PEP 740 provenance attestation
     (a strictly stronger signal than Trusted Publishing alone; implies it).
-  - has sdist
-  - has wheels
-  - pure-Python wheels   (platform tag "any")
-  - free-threaded wheels (Python tag matches cp<N>t, e.g. cp314t)
+  - has_sdist
+  - has_wheels
+  - pure_python: whether the wheels are pure-Python (platform tag "any")
+  - has_freethreaded: whether there are free-threaded CPython wheels (Python tag
+    matches cp<N>t, e.g. cp314t)
 
 Output: tab-separated table to stdout (header + one row per package, sorted).
 Progress and warnings go to stderr.
-
-To filter the output to packages with missing free-threaded wheels, use:
-
-$ awk -F'\t' '$7 == "no" && $8 == "no" {print $1}' deps_pypi_metadata.tsv
-
-To filter the output to packages without Trusted Publishing, use:
-
-$ awk -F'\t' '$3 == "no" {print $1}' deps_pypi_metadata.tsv
 """
 
 import argparse
@@ -268,27 +261,20 @@ def scrape_trusted_publishing(page: "Page", package: str, version: str, tp_filen
         try:
             page.wait_for_load_state("networkidle", timeout=8000)
             html = page.content()
-        except Exception:
+        except Exception:  # noqa: S110
             pass  # timeout is expected once analytics start; use whatever we have
     section_start = re.search(rf'id="{escaped}"', html)
     if not section_start:
         # Check if we're stuck on a CAPTCHA/bot-detection page
         if "captcha" in html.lower() or "challenge" in html.lower():
-            raise ScrapingError(
-                f"PyPI served a CAPTCHA challenge page for {package}; "
-                "automated scraping is blocked"
-            )
-        raise ScrapingError(
-            f"could not find file section for '{tp_filename}' in PyPI page for {package}/{version}"
-        )
+            raise ScrapingError(f"PyPI served a CAPTCHA challenge page for {package}; " "automated scraping is blocked")
+        raise ScrapingError(f"could not find file section for '{tp_filename}' in PyPI page for {package}/{version}")
     # Take a generous slice after the section start (next ~2 KB is enough)
     snippet = html[section_start.start() : section_start.start() + 2048]
     m = _TP_RE.search(snippet)
     if m:
         return m.group(1).lower() == "yes"
-    raise ScrapingError(
-        f"could not find 'Uploaded using Trusted Publishing?' text for {package}/{version}"
-    )
+    raise ScrapingError(f"could not find 'Uploaded using Trusted Publishing?' text for {package}/{version}")
 
 
 def check_package(package: str) -> Result:
@@ -296,21 +282,26 @@ def check_package(package: str) -> Result:
     Query PyPI for *package* and return a Result dict.
     On failure, *version* is None and *notes* contains the error message.
     """
+    # Failure shape: only "notes" is overridden below if data is missing or an
+    # exception is raised. Left untouched otherwise, so it's only ever mutated
+    # in a single, all-or-nothing step once every field has been computed.
+    result: Result = {
+        "package": package,
+        "notes": "",
+        "version": None,
+        "trusted_publishing": None,
+        "has_provenance": None,
+        "has_sdist": False,
+        "tp_check_fn": None,
+        "has_wheels": False,
+        "pure_python": None,
+        "has_freethreaded": None,
+    }
     try:
         data = get_pypi_info(package)
         if data is None:
-            return {
-                "package": package,
-                "notes": "not found on PyPI",
-                "version": None,
-                "trusted_publishing": None,
-                "has_provenance": None,
-                "has_sdist": False,
-                "tp_check_fn": None,
-                "has_wheels": False,
-                "pure_python": None,
-                "has_freethreaded": None,
-            }
+            result["notes"] = "not found on PyPI"
+            return result
 
         version = data["info"]["version"]
         has_sdist, has_wheels, pure_python, has_freethreaded, wheel_notes = analyse_wheels(data["urls"])
@@ -327,31 +318,23 @@ def check_package(package: str) -> Result:
         notes_parts = [p for p in (wheel_notes, provenance_error) if p]
         notes = "; ".join(notes_parts)
 
-        return {
-            "package": package,
-            "notes": notes,
-            "version": version,
-            "trusted_publishing": has_provenance or None,  # filled in later by scraper
-            "has_provenance": has_provenance,
-            "has_sdist": has_sdist,
-            "tp_check_fn": tp_check_fn,
-            "has_wheels": has_wheels,
-            "pure_python": pure_python,
-            "has_freethreaded": has_freethreaded,
-        }
+        result.update(
+            {
+                "notes": notes,
+                "version": version,
+                "trusted_publishing": has_provenance or None,  # filled in later by scraper
+                "has_provenance": has_provenance,
+                "has_sdist": has_sdist,
+                "tp_check_fn": tp_check_fn,
+                "has_wheels": has_wheels,
+                "pure_python": pure_python,
+                "has_freethreaded": has_freethreaded,
+            }
+        )
+        return result
     except Exception as exc:
-        return {
-            "package": package,
-            "notes": str(exc),
-            "version": None,
-            "trusted_publishing": None,
-            "has_provenance": None,
-            "has_sdist": False,
-            "tp_check_fn": None,
-            "has_wheels": False,
-            "pure_python": None,
-            "has_freethreaded": None,
-        }
+        result["notes"] = str(exc)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +349,7 @@ def _tri(value: bool | None) -> str:
     return "yes" if value else "no"
 
 
-COLUMNS = [
+COLUMNS = (
     "package",
     "version",
     "trusted_publishing",
@@ -376,23 +359,33 @@ COLUMNS = [
     "pure_python",
     "has_freethreaded",
     "notes",
-]
+)
+
+# Columns whose value is a bool|None (or bool) formatted via `_tri()` in `result_to_row()`.
+_TRI_COLUMNS = {
+    "trusted_publishing",
+    "has_provenance",
+    "has_sdist",
+    "has_wheels",
+    "pure_python",
+    "has_freethreaded",
+}
 
 
 def result_to_row(r: Result) -> list[str]:
-    if r["version"] is None:
-        return [r["package"], "", "", "", "", "", "", "", r["notes"]]
-    return [
-        r["package"],
-        r["version"],
-        _tri(r["trusted_publishing"]),
-        _tri(r["has_provenance"]),
-        _tri(r["has_sdist"]),
-        _tri(r["has_wheels"]),
-        _tri(r["pure_python"]),
-        _tri(r["has_freethreaded"]),
-        r["notes"],
-    ]
+    row = []
+    for col in COLUMNS:
+        if col in ("package", "notes"):
+            # These columns are always relevant and should be printed even if the package was not found on PyPI.
+            row.append(r[col])  # type: ignore[literal-required]
+        elif r["version"] is None:
+            # If the package was not found on PyPI, leave all other columns blank.
+            row.append("")
+        elif col in _TRI_COLUMNS:
+            row.append(_tri(r[col]))  # type: ignore[literal-required]
+        else:
+            row.append(r[col])  # type: ignore[literal-required]
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -511,9 +504,7 @@ def main(argv: list[str] | None = None) -> None:
                     )
                     page = context.new_page()
                     # Remove navigator.webdriver to avoid detection
-                    page.add_init_script(
-                        'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
-                    )
+                    page.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined});')
                     # Block resources we don't need so pages load faster.
                     # Use fulfill (empty 200) rather than abort — aborting
                     # sub-resources can propagate net::ERR_ABORTED to the main

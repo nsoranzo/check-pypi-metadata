@@ -17,3 +17,9 @@ check-pypi-metadata = "check_pypi_metadata:main"
 
 [tool.black]
 line-length = 120
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["B9", "BLE001", "I001"]
