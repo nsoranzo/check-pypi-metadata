@@ -14,6 +14,7 @@ For each package it reports:
 | `has_wheels` | Binary wheels available? |
 | `pure_python` | Wheels are pure Python (`py3-none-any`)? |
 | `has_freethreaded` | Free-threaded CPython wheels available? |
+| `latest_python_wheel` | Newest CPython version with a wheel (e.g. `3.13`); `3.10+` for a stable-ABI (`abi3`) wheel, forward-compatible with later releases too; `n/a` for pure-Python packages |
 | `notes` | Warnings or error messages |
 
 Output is a tab-separated table written to stdout (one row per package, sorted
@@ -66,6 +67,15 @@ Packages not using Trusted Publishing:
 
 ```
 awk -F'\t' '$3 == "no" {print $1}' metadata.tsv
+```
+
+Packages whose latest wheel doesn't yet target Python 3.15 (comparing
+major/minor as integers, since e.g. `"3.9" < "3.15"` is false when compared
+as plain numbers; `+`-suffixed values are skipped since a stable-ABI wheel
+already covers later releases, including 3.15):
+
+```
+awk -F'\t' '$9 != "n/a" && $9 !~ /\+$/ { split($9, v, "."); if (v[1] < 3 || (v[1] == 3 && v[2] < 15)) print $1, $9 }' metadata.tsv
 ```
 
 ## How Trusted Publishing is determined

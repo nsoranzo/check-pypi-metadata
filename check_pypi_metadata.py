@@ -19,6 +19,9 @@ metadata about the latest release:
   - pure_python: whether the wheels are pure-Python (platform tag "any")
   - has_freethreaded: whether there are free-threaded CPython wheels (Python tag
     matches cp<N>t, e.g. cp314t)
+  - latest_python_wheel: the newest CPython version for which a wheel was built
+    (e.g. "3.13"); "3.10+" for a stable-ABI (abi3) wheel, which is forward-compatible
+    with later releases too; "n/a" for pure-Python packages
 
 Output: tab-separated table to stdout (header + one row per package, sorted).
 Progress and warnings go to stderr.
@@ -61,6 +64,9 @@ _DEFAULT_BROWSER_CANDIDATES = [
 
 # Matches free-threaded CPython tags such as cp313t, cp314t
 _FREETHREADED_RE = re.compile(r"cp\d+t$")
+# Matches CPython tags such as cp39, cp313, cp313t; group 1 is the major digit,
+# group 2 is the (possibly multi-digit) minor version.
+_CP_TAG_RE = re.compile(r"^cp(\d)(\d+)t?$")
 # PEP 503 name normalisation: collapse runs of [-_.] to a single dash
 _NORMALISE_NAME_RE = re.compile(r"[-_.]+")
 
@@ -81,6 +87,7 @@ class Result(TypedDict):
     has_wheels: bool
     pure_python: bool | None
     has_freethreaded: bool | None
+    latest_python_wheel: str | None
 
 
 def parse_requirements(files: list[Path]) -> list[str]:
@@ -140,14 +147,31 @@ def _wheel_tags(filename: str) -> tuple[list[str], str, str] | None:
     return python_tag.split("."), abi_tag, platform_tag
 
 
-def analyse_wheels(urls: list[dict[str, Any]]) -> tuple[bool, bool, bool | None, bool | None, str]:
+def _cp_version(tag: str) -> tuple[int, int] | None:
+    """Parse a CPython tag such as 'cp313' or 'cp313t' into (major, minor); else None."""
+    m = _CP_TAG_RE.match(tag)
+    if m is None:
+        # Expected for non-CPython interpreter tags (e.g. PyPy "pp310", GraalPy
+        # "gp313"); not an error, so not surfaced in notes.
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def analyse_wheels(
+    urls: list[dict[str, Any]],
+) -> tuple[bool, bool, bool | None, bool | None, str | None, str]:
     """
     Given the list of file dicts from the PyPI JSON "urls" field, return:
-      has_sdist        bool
-      has_wheels       bool
-      pure_python      bool | None  (None when no wheels)
-      has_freethreaded bool | None  (None when wheels are pure Python or absent)
-      notes            str          (non-empty when wheel filenames could not be parsed)
+      has_sdist            bool
+      has_wheels           bool
+      pure_python          bool | None  (None when no wheels)
+      has_freethreaded     bool | None  (None when wheels are pure Python or absent)
+      latest_python_wheel  str | None   (e.g. "3.13"; "3.10+" for a stable-ABI/abi3 wheel,
+                                          forward-compatible with later releases; None when
+                                          wheels are pure Python, absent, or have no
+                                          parseable CPython tag)
+      notes                str          (non-empty when one or more wheel filenames could
+                                          not be parsed, even if others were)
     """
     has_sdist = False
     wheel_files = []
@@ -159,40 +183,62 @@ def analyse_wheels(urls: list[dict[str, Any]]) -> tuple[bool, bool, bool | None,
 
     has_wheels = bool(wheel_files)
     if not has_wheels:
-        return has_sdist, False, None, None, ""
+        return has_sdist, False, None, None, None, ""
 
     # A wheel is pure Python when its platform tag is "any"
     platform_tags = set()
     python_tags_flat = set()
     abi_tags_flat = set()
+    # ((major, minor), is_abi3) for each parseable CPython tag, one pair per wheel/tag.
+    cp_versions_with_abi3: list[tuple[tuple[int, int], bool]] = []
+    unparsed_count = 0
     for fn in wheel_files:
         parsed = _wheel_tags(fn)
         if parsed is None:
+            unparsed_count += 1
             continue
         py_tags, abi_tag, plat = parsed
         platform_tags.add(plat)
         python_tags_flat.update(py_tags)
         abi_tags_flat.add(abi_tag)
+        # A wheel tagged e.g. "cp310-abi3" is built against the stable/limited
+        # C API: it's forward-compatible with every later 3.x release, not just
+        # the one named in the python tag.
+        is_abi3 = abi_tag == "abi3"
+        for pt in py_tags:
+            v = _cp_version(pt)
+            if v is not None:
+                cp_versions_with_abi3.append((v, is_abi3))
 
     if not platform_tags:
         # All wheel filenames failed to parse; cannot determine characteristics.
-        return has_sdist, True, None, None, "could not parse any wheel filename"
+        return has_sdist, True, None, None, None, "could not parse any wheel filename"
 
     pure_python = platform_tags == {"any"}
 
     if pure_python:
         has_freethreaded = None
+        latest_python_wheel = None
     elif abi_tags_flat == {"none"}:
         # All wheels use ABI "none" (binary bundles not compiled against Python
         # headers, e.g. nodejs-wheel-binaries, playwright, pylibmagic, typos).
-        # Free-threading is not applicable to these packages.
+        # Free-threading and the CPython version are not applicable to these packages.
         has_freethreaded = None
+        latest_python_wheel = None
     else:
         # Check both python tags (e.g. cp313t-cp313t) and ABI tags
         # (e.g. cp314-cp314t) — the convention differs across releases.
-        has_freethreaded = any(_FREETHREADED_RE.match(t) for t in python_tags_flat | abi_tags_flat)
+        combined_tags = python_tags_flat | abi_tags_flat
+        has_freethreaded = any(_FREETHREADED_RE.match(t) for t in combined_tags)
+        if cp_versions_with_abi3:
+            (major, minor), is_abi3 = max(cp_versions_with_abi3)
+            latest_python_wheel = f"{major}.{minor}+" if is_abi3 else f"{major}.{minor}"
+        else:
+            latest_python_wheel = None
 
-    return has_sdist, True, pure_python, has_freethreaded, ""
+    notes = f"could not parse {unparsed_count} of {len(wheel_files)} wheel filenames" if unparsed_count else ""
+
+    return has_sdist, True, pure_python, has_freethreaded, latest_python_wheel, notes
 
 
 def check_provenance(package: str, version: str, sdist_filename: str) -> tuple[bool, str | None]:
@@ -296,6 +342,7 @@ def check_package(package: str) -> Result:
         "has_wheels": False,
         "pure_python": None,
         "has_freethreaded": None,
+        "latest_python_wheel": None,
     }
     try:
         data = get_pypi_info(package)
@@ -304,7 +351,9 @@ def check_package(package: str) -> Result:
             return result
 
         version = data["info"]["version"]
-        has_sdist, has_wheels, pure_python, has_freethreaded, wheel_notes = analyse_wheels(data["urls"])
+        has_sdist, has_wheels, pure_python, has_freethreaded, latest_python_wheel, wheel_notes = analyse_wheels(
+            data["urls"]
+        )
 
         # Check for PEP 740 provenance attestation via the Integrity API.
         # Use the sdist if present; fall back to the first wheel for packages
@@ -329,6 +378,7 @@ def check_package(package: str) -> Result:
                 "has_wheels": has_wheels,
                 "pure_python": pure_python,
                 "has_freethreaded": has_freethreaded,
+                "latest_python_wheel": latest_python_wheel,
             }
         )
         return result
@@ -349,6 +399,11 @@ def _tri(value: bool | None) -> str:
     return "yes" if value else "no"
 
 
+def _opt(value: str | None) -> str:
+    """Format a str|None as itself, or n/a when None."""
+    return value if value is not None else "n/a"
+
+
 COLUMNS = (
     "package",
     "version",
@@ -358,6 +413,7 @@ COLUMNS = (
     "has_wheels",
     "pure_python",
     "has_freethreaded",
+    "latest_python_wheel",
     "notes",
 )
 
@@ -369,6 +425,11 @@ _TRI_COLUMNS = {
     "has_wheels",
     "pure_python",
     "has_freethreaded",
+}
+
+# Columns whose value is a str|None formatted via `_opt()` in `result_to_row()`.
+_OPT_COLUMNS = {
+    "latest_python_wheel",
 }
 
 
@@ -383,6 +444,8 @@ def result_to_row(r: Result) -> list[str]:
             row.append("")
         elif col in _TRI_COLUMNS:
             row.append(_tri(r[col]))  # type: ignore[literal-required]
+        elif col in _OPT_COLUMNS:
+            row.append(_opt(r[col]))  # type: ignore[literal-required]
         else:
             row.append(r[col])  # type: ignore[literal-required]
     return row
@@ -397,7 +460,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Query PyPI for packages listed in requirements files and report metadata "
-            "(Trusted Publishing, PEP 740 provenance, wheel availability, pure-Python, free-threaded)."
+            "(Trusted Publishing, PEP 740 provenance, wheel availability, pure-Python, "
+            "free-threaded, latest Python wheel)."
         )
     )
     parser.add_argument(
