@@ -19,12 +19,11 @@ metadata about the latest release:
   - pure_python: whether the wheels are pure-Python (platform tag "any")
   - latest_python_wheel: the newest CPython version for which a (regular, non-free-
     threaded) wheel was built (e.g. "3.13"); "3.10+" for a stable-ABI (abi3) wheel,
-    which is forward-compatible with later releases too; "n/a" for pure-Python packages
+    which is forward-compatible with later releases too; "missing" if the package
+    has other CPython wheels but none on this line; "n/a" for pure-Python packages
   - latest_freethreaded_wheel: same as latest_python_wheel, but for free-threaded
-    CPython wheels (Python or ABI tag matches cp<N>t, e.g. cp314t, or the PEP 803
-    "abi3t" stable ABI, which is likewise forward-compatible); "missing" when
-    free-threading applies but no such wheel has been published yet; "n/a" for
-    pure-Python packages
+    CPython wheels (ABI tag matches cp<N>t, e.g. cp314t, or the PEP 803 "abi3t"
+    stable ABI, which is likewise forward-compatible)
 
 Output: tab-separated table to stdout (header + one row per package, sorted).
 Progress and warnings go to stderr.
@@ -68,9 +67,10 @@ _DEFAULT_BROWSER_CANDIDATES = [
 # Matches free-threaded CPython tags such as cp313t, cp314t, and the "abi3t" stable
 # ABI for free-threaded builds introduced in CPython 3.15 (PEP 803).
 _FREETHREADED_RE = re.compile(r"(?:cp\d+|abi3)t$")
-# Matches CPython tags such as cp39, cp313, cp313t; group 1 is the major digit,
-# group 2 is the (possibly multi-digit) minor version.
-_CP_TAG_RE = re.compile(r"^cp(\d)(\d+)t?$")
+# Matches CPython interpreter tags such as cp39, cp313 (never "t"-suffixed —
+# unlike the ABI tag, free-threading doesn't affect the interpreter tag); group 1
+# is the major digit, group 2 is the (possibly multi-digit) minor version.
+_CP_TAG_RE = re.compile(r"^cp(\d)(\d+)$")
 # PEP 503 name normalisation: collapse runs of [-_.] to a single dash
 _NORMALISE_NAME_RE = re.compile(r"[-_.]+")
 
@@ -95,12 +95,14 @@ class Result(TypedDict):
 
 
 def parse_requirements(files: list[Path]) -> list[str]:
-    """Extract sorted unique package names from one or more requirements files."""
+    """
+    Extract sorted unique package names from one or more requirements files.
+    Exits the process if any *files* entry does not exist.
+    """
     packages = set()
     for req_file in files:
         if not req_file.exists():
-            print(f"Warning: {req_file} not found, skipping.", file=sys.stderr)
-            continue
+            sys.exit(f"Error: {req_file} not found.")
         with open(req_file) as f:
             for line in f:
                 line = line.strip()
@@ -152,7 +154,7 @@ def _wheel_tags(filename: str) -> tuple[list[str], str, str] | None:
 
 
 def _cp_version(tag: str) -> tuple[int, int] | None:
-    """Parse a CPython tag such as 'cp313' or 'cp313t' into (major, minor); else None."""
+    """Parse a CPython interpreter tag such as 'cp313' into (major, minor); else None."""
     m = _CP_TAG_RE.match(tag)
     if m is None:
         # Expected for non-CPython interpreter tags (e.g. PyPy "pp310", GraalPy
@@ -161,10 +163,12 @@ def _cp_version(tag: str) -> tuple[int, int] | None:
     return int(m.group(1)), int(m.group(2))
 
 
-def _format_latest_cp_wheel(versions: list[tuple[tuple[int, int], bool]]) -> str | None:
+def _format_latest_cp_wheel(versions: list[tuple[tuple[int, int], bool]]) -> str:
     """
     Summarize a set of (version, is_stable_abi) entries for one line (regular or
-    free-threaded) as a single "latest wheel" string, or None if *versions* is empty.
+    free-threaded) as a single "latest wheel" string, or "missing" if *versions*
+    is empty (the line is applicable — the package isn't pure Python or an
+    ABI-agnostic binary bundle — but has no wheel of its own).
 
     A stable-ABI (abi3/abi3t) wheel is forward-compatible with every later
     release, so if one or more exist, the LOWEST stable-ABI minimum already
@@ -177,7 +181,7 @@ def _format_latest_cp_wheel(versions: list[tuple[tuple[int, int], bool]]) -> str
     current ceiling of support.
     """
     if not versions:
-        return None
+        return "missing"
     stable_versions = [v for v, is_stable_abi in versions if is_stable_abi]
     if stable_versions:
         major, minor = min(stable_versions)
@@ -197,15 +201,14 @@ def analyse_wheels(
       latest_python_wheel        str | None   (e.g. "3.13"; "3.10+" for a stable-ABI
                                                 (abi3) wheel, forward-compatible with
                                                 later releases; reflects the regular
-                                                (GIL) build only; None when wheels are
-                                                pure Python, absent, or have no
-                                                parseable regular CPython tag)
+                                                (GIL) build only; "missing" if the
+                                                package has other (e.g. free-threaded-
+                                                only) CPython wheels but none on this
+                                                line; None when wheels are pure Python,
+                                                absent, or have no parseable CPython tag)
       latest_freethreaded_wheel  str | None   (same as latest_python_wheel, but for
                                                 free-threaded wheels, where "+" denotes
-                                                the PEP 803 "abi3t" stable ABI instead;
-                                                "missing" instead of None when free-
-                                                threading applies but no such wheel has
-                                                been published yet)
+                                                the PEP 803 "abi3t" stable ABI instead)
       notes                      str          (non-empty when one or more wheel filenames
                                                 could not be parsed, even if others were)
     """
@@ -252,10 +255,10 @@ def analyse_wheels(
             # stable ABI, so packages ship them as exact-version wheels
             # alongside a separate, wider-reaching abi3 line for the regular
             # (GIL) build — e.g. PyNaCl 1.6.2 ships both cp38-abi3 (regular,
-            # 3.8+) and cp314-cp314t (free-threaded, 3.14t only).
-            is_freethreaded = bool(_FREETHREADED_RE.match(abi_subtag)) or any(
-                _FREETHREADED_RE.match(pt) for pt in py_tags
-            )
+            # 3.8+) and cp314-cp314t (free-threaded, 3.14t only). The
+            # free-threading marker is only ever part of the ABI tag, never
+            # the interpreter tag.
+            is_freethreaded = bool(_FREETHREADED_RE.match(abi_subtag))
             for pt in py_tags:
                 v = _cp_version(pt)
                 if v is not None:
@@ -279,11 +282,14 @@ def analyse_wheels(
     else:
         # Report the regular (GIL) build's and the free-threaded build's
         # compatibility separately — they can differ (see the PyNaCl example
-        # above).
+        # above). Each is "missing" (not None/n-a) if the package has CPython
+        # wheels but none on that particular line — free-threaded-only
+        # packages are as much a real (if currently rare) gap as the far more
+        # common regular-only ones, so both are reported the same way.
         regular_versions = [(v, is_stable_abi) for v, is_stable_abi, is_ft in cp_versions if not is_ft]
         freethreaded_versions = [(v, is_stable_abi) for v, is_stable_abi, is_ft in cp_versions if is_ft]
         latest_python_wheel = _format_latest_cp_wheel(regular_versions)
-        latest_freethreaded_wheel = _format_latest_cp_wheel(freethreaded_versions) or "missing"
+        latest_freethreaded_wheel = _format_latest_cp_wheel(freethreaded_versions)
 
     notes = f"could not parse {unparsed_count} of {len(wheel_files)} wheel filenames" if unparsed_count else ""
 

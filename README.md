@@ -13,8 +13,8 @@ For each package it reports:
 | `has_sdist` | Source distribution available? |
 | `has_wheels` | Binary wheels available? |
 | `pure_python` | Wheels are pure Python (`py3-none-any`)? |
-| `latest_python_wheel` | Newest CPython version with a (regular, non-free-threaded) wheel (e.g. `3.13`); `3.10+` for a stable-ABI (`abi3`) wheel, forward-compatible with later releases too; `n/a` for pure-Python packages |
-| `latest_freethreaded_wheel` | Same as `latest_python_wheel`, but for free-threaded wheels (`+` denotes the [PEP 803](https://peps.python.org/pep-0803/) `abi3t` stable ABI instead); `missing` when free-threading applies but no such wheel has been published yet; `n/a` for pure-Python packages |
+| `latest_python_wheel` | Newest CPython version with a (regular, non-free-threaded) wheel (e.g. `3.13`); `3.10+` for a stable-ABI (`abi3`) wheel, forward-compatible with later releases too; `missing` if the package has other CPython wheels but none on this line; `n/a` for pure-Python packages |
+| `latest_freethreaded_wheel` | Same as `latest_python_wheel`, but for free-threaded wheels (`+` denotes the [PEP 803](https://peps.python.org/pep-0803/) `abi3t` stable ABI instead) |
 | `notes` | Warnings or error messages |
 
 Output is a tab-separated table written to stdout (one row per package, sorted
@@ -72,10 +72,11 @@ awk -F'\t' '$3 == "no" {print $1}' metadata.tsv
 Packages whose latest wheel doesn't yet target Python 3.15 (comparing
 major/minor as integers, since e.g. `"3.9" < "3.15"` is false when compared
 as plain numbers; `+`-suffixed values are skipped since a stable-ABI wheel
-already covers later releases, including 3.15):
+already covers later releases, including 3.15; `n/a`/`missing` values are
+already self-explanatory, so skipped too):
 
 ```
-awk -F'\t' '$8 != "n/a" && $8 !~ /\+$/ { split($8, v, "."); if (v[1] < 3 || (v[1] == 3 && v[2] < 15)) print $1, $8 }' metadata.tsv
+awk -F'\t' '$8 != "n/a" && $8 != "missing" && $8 !~ /\+$/ { split($8, v, "."); if (v[1] < 3 || (v[1] == 3 && v[2] < 15)) print $1, $8 }' metadata.tsv
 ```
 
 ## How Trusted Publishing is determined
