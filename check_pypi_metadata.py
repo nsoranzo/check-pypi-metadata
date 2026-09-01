@@ -43,8 +43,8 @@ from concurrent.futures import (
 from pathlib import Path
 from typing import (
     Any,
-    TypedDict,
     TYPE_CHECKING,
+    TypedDict,
 )
 
 if TYPE_CHECKING:
