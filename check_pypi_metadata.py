@@ -17,11 +17,14 @@ metadata about the latest release:
   - has_sdist
   - has_wheels
   - pure_python: whether the wheels are pure-Python (platform tag "any")
-  - has_freethreaded: whether there are free-threaded CPython wheels (Python tag
-    matches cp<N>t, e.g. cp314t)
-  - latest_python_wheel: the newest CPython version for which a wheel was built
-    (e.g. "3.13"); "3.10+" for a stable-ABI (abi3) wheel, which is forward-compatible
-    with later releases too; "n/a" for pure-Python packages
+  - latest_python_wheel: the newest CPython version for which a (regular, non-free-
+    threaded) wheel was built (e.g. "3.13"); "3.10+" for a stable-ABI (abi3) wheel,
+    which is forward-compatible with later releases too; "n/a" for pure-Python packages
+  - latest_freethreaded_wheel: same as latest_python_wheel, but for free-threaded
+    CPython wheels (Python or ABI tag matches cp<N>t, e.g. cp314t, or the PEP 803
+    "abi3t" stable ABI, which is likewise forward-compatible); "missing" when
+    free-threading applies but no such wheel has been published yet; "n/a" for
+    pure-Python packages
 
 Output: tab-separated table to stdout (header + one row per package, sorted).
 Progress and warnings go to stderr.
@@ -62,8 +65,9 @@ _DEFAULT_BROWSER_CANDIDATES = [
     "/usr/bin/google-chrome-stable",
 ]
 
-# Matches free-threaded CPython tags such as cp313t, cp314t
-_FREETHREADED_RE = re.compile(r"cp\d+t$")
+# Matches free-threaded CPython tags such as cp313t, cp314t, and the "abi3t" stable
+# ABI for free-threaded builds introduced in CPython 3.15 (PEP 803).
+_FREETHREADED_RE = re.compile(r"(?:cp\d+|abi3)t$")
 # Matches CPython tags such as cp39, cp313, cp313t; group 1 is the major digit,
 # group 2 is the (possibly multi-digit) minor version.
 _CP_TAG_RE = re.compile(r"^cp(\d)(\d+)t?$")
@@ -86,8 +90,8 @@ class Result(TypedDict):
     tp_check_fn: str | None
     has_wheels: bool
     pure_python: bool | None
-    has_freethreaded: bool | None
     latest_python_wheel: str | None
+    latest_freethreaded_wheel: str | None
 
 
 def parse_requirements(files: list[Path]) -> list[str]:
@@ -157,21 +161,53 @@ def _cp_version(tag: str) -> tuple[int, int] | None:
     return int(m.group(1)), int(m.group(2))
 
 
+def _format_latest_cp_wheel(versions: list[tuple[tuple[int, int], bool]]) -> str | None:
+    """
+    Summarize a set of (version, is_stable_abi) entries for one line (regular or
+    free-threaded) as a single "latest wheel" string, or None if *versions* is empty.
+
+    A stable-ABI (abi3/abi3t) wheel is forward-compatible with every later
+    release, so if one or more exist, the LOWEST stable-ABI minimum already
+    covers everything any higher-minimum stable-ABI wheel — or any exact
+    wheel — would add. E.g. ast-serialize 0.8.0 ships both cp39-abi3 and (via
+    a compound cp315-abi3.abi3t wheel, see PEP 803) a redundant, later-
+    anchored abi3 entry; the correct summary is "3.9+", not "3.15+".
+    Without any stable-ABI entry, report the highest exact version instead,
+    since exact wheels don't extend forward and the highest one is the
+    current ceiling of support.
+    """
+    if not versions:
+        return None
+    stable_versions = [v for v, is_stable_abi in versions if is_stable_abi]
+    if stable_versions:
+        major, minor = min(stable_versions)
+        return f"{major}.{minor}+"
+    major, minor = max(v for v, _ in versions)
+    return f"{major}.{minor}"
+
+
 def analyse_wheels(
     urls: list[dict[str, Any]],
-) -> tuple[bool, bool, bool | None, bool | None, str | None, str]:
+) -> tuple[bool, bool, bool | None, str | None, str | None, str]:
     """
     Given the list of file dicts from the PyPI JSON "urls" field, return:
-      has_sdist            bool
-      has_wheels           bool
-      pure_python          bool | None  (None when no wheels)
-      has_freethreaded     bool | None  (None when wheels are pure Python or absent)
-      latest_python_wheel  str | None   (e.g. "3.13"; "3.10+" for a stable-ABI/abi3 wheel,
-                                          forward-compatible with later releases; None when
-                                          wheels are pure Python, absent, or have no
-                                          parseable CPython tag)
-      notes                str          (non-empty when one or more wheel filenames could
-                                          not be parsed, even if others were)
+      has_sdist                  bool
+      has_wheels                 bool
+      pure_python                bool | None  (None when no wheels)
+      latest_python_wheel        str | None   (e.g. "3.13"; "3.10+" for a stable-ABI
+                                                (abi3) wheel, forward-compatible with
+                                                later releases; reflects the regular
+                                                (GIL) build only; None when wheels are
+                                                pure Python, absent, or have no
+                                                parseable regular CPython tag)
+      latest_freethreaded_wheel  str | None   (same as latest_python_wheel, but for
+                                                free-threaded wheels, where "+" denotes
+                                                the PEP 803 "abi3t" stable ABI instead;
+                                                "missing" instead of None when free-
+                                                threading applies but no such wheel has
+                                                been published yet)
+      notes                      str          (non-empty when one or more wheel filenames
+                                                could not be parsed, even if others were)
     """
     has_sdist = False
     wheel_files = []
@@ -187,10 +223,10 @@ def analyse_wheels(
 
     # A wheel is pure Python when its platform tag is "any"
     platform_tags = set()
-    python_tags_flat = set()
     abi_tags_flat = set()
-    # ((major, minor), is_abi3) for each parseable CPython tag, one pair per wheel/tag.
-    cp_versions_with_abi3: list[tuple[tuple[int, int], bool]] = []
+    # ((major, minor), is_stable_abi, is_freethreaded) for each parseable CPython
+    # tag, one entry per wheel/tag.
+    cp_versions: list[tuple[tuple[int, int], bool, bool]] = []
     unparsed_count = 0
     for fn in wheel_files:
         parsed = _wheel_tags(fn)
@@ -199,16 +235,31 @@ def analyse_wheels(
             continue
         py_tags, abi_tag, plat = parsed
         platform_tags.add(plat)
-        python_tags_flat.update(py_tags)
-        abi_tags_flat.add(abi_tag)
-        # A wheel tagged e.g. "cp310-abi3" is built against the stable/limited
-        # C API: it's forward-compatible with every later 3.x release, not just
-        # the one named in the python tag.
-        is_abi3 = abi_tag == "abi3"
-        for pt in py_tags:
-            v = _cp_version(pt)
-            if v is not None:
-                cp_versions_with_abi3.append((v, is_abi3))
+        # A wheel's ABI tag can be a "compressed" set, e.g. "abi3.abi3t" (PEP
+        # 803): such a wheel is compatible with CPython under EITHER ABI, so
+        # each sub-tag is treated as its own, independent entry below.
+        abi_subtags = abi_tag.split(".")
+        abi_tags_flat.update(abi_subtags)
+        for abi_subtag in abi_subtags:
+            # A wheel tagged e.g. "cp310-abi3" is built against the stable/
+            # limited C API: it's forward-compatible with every later 3.x
+            # release, not just the one named in the python tag. "abi3t" is
+            # the free-threaded-build counterpart introduced in CPython 3.15
+            # (PEP 803), with the same forward-compatibility guarantee along
+            # the free-threaded line.
+            is_stable_abi = abi_subtag in ("abi3", "abi3t")
+            # Before CPython 3.15, free-threaded builds don't support the
+            # stable ABI, so packages ship them as exact-version wheels
+            # alongside a separate, wider-reaching abi3 line for the regular
+            # (GIL) build — e.g. PyNaCl 1.6.2 ships both cp38-abi3 (regular,
+            # 3.8+) and cp314-cp314t (free-threaded, 3.14t only).
+            is_freethreaded = bool(_FREETHREADED_RE.match(abi_subtag)) or any(
+                _FREETHREADED_RE.match(pt) for pt in py_tags
+            )
+            for pt in py_tags:
+                v = _cp_version(pt)
+                if v is not None:
+                    cp_versions.append((v, is_stable_abi, is_freethreaded))
 
     if not platform_tags:
         # All wheel filenames failed to parse; cannot determine characteristics.
@@ -217,28 +268,26 @@ def analyse_wheels(
     pure_python = platform_tags == {"any"}
 
     if pure_python:
-        has_freethreaded = None
         latest_python_wheel = None
+        latest_freethreaded_wheel = None
     elif abi_tags_flat == {"none"}:
         # All wheels use ABI "none" (binary bundles not compiled against Python
         # headers, e.g. nodejs-wheel-binaries, playwright, pylibmagic, typos).
         # Free-threading and the CPython version are not applicable to these packages.
-        has_freethreaded = None
         latest_python_wheel = None
+        latest_freethreaded_wheel = None
     else:
-        # Check both python tags (e.g. cp313t-cp313t) and ABI tags
-        # (e.g. cp314-cp314t) — the convention differs across releases.
-        combined_tags = python_tags_flat | abi_tags_flat
-        has_freethreaded = any(_FREETHREADED_RE.match(t) for t in combined_tags)
-        if cp_versions_with_abi3:
-            (major, minor), is_abi3 = max(cp_versions_with_abi3)
-            latest_python_wheel = f"{major}.{minor}+" if is_abi3 else f"{major}.{minor}"
-        else:
-            latest_python_wheel = None
+        # Report the regular (GIL) build's and the free-threaded build's
+        # compatibility separately — they can differ (see the PyNaCl example
+        # above).
+        regular_versions = [(v, is_stable_abi) for v, is_stable_abi, is_ft in cp_versions if not is_ft]
+        freethreaded_versions = [(v, is_stable_abi) for v, is_stable_abi, is_ft in cp_versions if is_ft]
+        latest_python_wheel = _format_latest_cp_wheel(regular_versions)
+        latest_freethreaded_wheel = _format_latest_cp_wheel(freethreaded_versions) or "missing"
 
     notes = f"could not parse {unparsed_count} of {len(wheel_files)} wheel filenames" if unparsed_count else ""
 
-    return has_sdist, True, pure_python, has_freethreaded, latest_python_wheel, notes
+    return has_sdist, True, pure_python, latest_python_wheel, latest_freethreaded_wheel, notes
 
 
 def check_provenance(package: str, version: str, sdist_filename: str) -> tuple[bool, str | None]:
@@ -341,8 +390,8 @@ def check_package(package: str) -> Result:
         "tp_check_fn": None,
         "has_wheels": False,
         "pure_python": None,
-        "has_freethreaded": None,
         "latest_python_wheel": None,
+        "latest_freethreaded_wheel": None,
     }
     try:
         data = get_pypi_info(package)
@@ -351,8 +400,8 @@ def check_package(package: str) -> Result:
             return result
 
         version = data["info"]["version"]
-        has_sdist, has_wheels, pure_python, has_freethreaded, latest_python_wheel, wheel_notes = analyse_wheels(
-            data["urls"]
+        has_sdist, has_wheels, pure_python, latest_python_wheel, latest_freethreaded_wheel, wheel_notes = (
+            analyse_wheels(data["urls"])
         )
 
         # Check for PEP 740 provenance attestation via the Integrity API.
@@ -377,8 +426,8 @@ def check_package(package: str) -> Result:
                 "tp_check_fn": tp_check_fn,
                 "has_wheels": has_wheels,
                 "pure_python": pure_python,
-                "has_freethreaded": has_freethreaded,
                 "latest_python_wheel": latest_python_wheel,
+                "latest_freethreaded_wheel": latest_freethreaded_wheel,
             }
         )
         return result
@@ -412,8 +461,8 @@ COLUMNS = (
     "has_sdist",
     "has_wheels",
     "pure_python",
-    "has_freethreaded",
     "latest_python_wheel",
+    "latest_freethreaded_wheel",
     "notes",
 )
 
@@ -424,12 +473,12 @@ _TRI_COLUMNS = {
     "has_sdist",
     "has_wheels",
     "pure_python",
-    "has_freethreaded",
 }
 
 # Columns whose value is a str|None formatted via `_opt()` in `result_to_row()`.
 _OPT_COLUMNS = {
     "latest_python_wheel",
+    "latest_freethreaded_wheel",
 }
 
 

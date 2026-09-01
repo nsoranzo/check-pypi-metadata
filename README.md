@@ -13,8 +13,8 @@ For each package it reports:
 | `has_sdist` | Source distribution available? |
 | `has_wheels` | Binary wheels available? |
 | `pure_python` | Wheels are pure Python (`py3-none-any`)? |
-| `has_freethreaded` | Free-threaded CPython wheels available? |
-| `latest_python_wheel` | Newest CPython version with a wheel (e.g. `3.13`); `3.10+` for a stable-ABI (`abi3`) wheel, forward-compatible with later releases too; `n/a` for pure-Python packages |
+| `latest_python_wheel` | Newest CPython version with a (regular, non-free-threaded) wheel (e.g. `3.13`); `3.10+` for a stable-ABI (`abi3`) wheel, forward-compatible with later releases too; `n/a` for pure-Python packages |
+| `latest_freethreaded_wheel` | Same as `latest_python_wheel`, but for free-threaded wheels (`+` denotes the [PEP 803](https://peps.python.org/pep-0803/) `abi3t` stable ABI instead); `missing` when free-threading applies but no such wheel has been published yet; `n/a` for pure-Python packages |
 | `notes` | Warnings or error messages |
 
 Output is a tab-separated table written to stdout (one row per package, sorted
@@ -60,7 +60,7 @@ check-pypi-metadata > metadata.tsv
 Packages missing free-threaded wheels:
 
 ```
-awk -F'\t' '$7 == "no" && $8 == "no" {print $1}' metadata.tsv
+awk -F'\t' '$9 == "missing" {print $1}' metadata.tsv
 ```
 
 Packages not using Trusted Publishing:
@@ -75,7 +75,7 @@ as plain numbers; `+`-suffixed values are skipped since a stable-ABI wheel
 already covers later releases, including 3.15):
 
 ```
-awk -F'\t' '$9 != "n/a" && $9 !~ /\+$/ { split($9, v, "."); if (v[1] < 3 || (v[1] == 3 && v[2] < 15)) print $1, $9 }' metadata.tsv
+awk -F'\t' '$8 != "n/a" && $8 !~ /\+$/ { split($8, v, "."); if (v[1] < 3 || (v[1] == 3 && v[2] < 15)) print $1, $8 }' metadata.tsv
 ```
 
 ## How Trusted Publishing is determined
