@@ -1,7 +1,9 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import check_pypi_metadata
 from check_pypi_metadata import (
     _cp_version,
     _format_latest_cp_wheel,
@@ -9,6 +11,7 @@ from check_pypi_metadata import (
     _tri,
     _wheel_tags,
     analyse_wheels,
+    check_package,
     COLUMNS,
     parse_requirements,
     Result,
@@ -22,6 +25,10 @@ def wheel(filename: str) -> dict:
 
 def sdist(filename: str = "pkg-1.0.tar.gz") -> dict:
     return {"packagetype": "sdist", "filename": filename}
+
+
+def pypi_info(version: str = "1.0", urls: list[dict] | None = None) -> dict[str, Any]:
+    return {"info": {"version": version}, "urls": urls or []}
 
 
 class TestParseRequirements:
@@ -114,6 +121,11 @@ _ANALYSE_WHEELS_CASES: list[tuple[str, list[dict], tuple[bool, bool, bool | None
         "no wheels at all",
         [sdist()],
         (True, False, None, None, None, ""),
+    ),
+    (
+        "no sdist and no wheels at all",
+        [],
+        (False, False, None, None, None, "no sdist or wheels for this release"),
     ),
     (
         "pure-Python wheel",
@@ -259,3 +271,110 @@ class TestResultToRow:
         for col in COLUMNS:
             if col not in ("package", "notes"):
                 assert row[col] == "", col
+
+
+_FAILURE_SHAPE: Result = {
+    "package": "",
+    "notes": "",
+    "version": None,
+    "trusted_publishing": None,
+    "has_provenance": None,
+    "has_sdist": False,
+    "tp_check_fn": None,
+    "has_wheels": False,
+    "pure_python": None,
+    "latest_python_wheel": None,
+    "latest_freethreaded_wheel": None,
+}
+
+
+class TestCheckPackage:
+    def test_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(check_pypi_metadata, "get_pypi_info", lambda package: None)
+        result = check_package("nope")
+        assert result == {**_FAILURE_SHAPE, "package": "nope", "notes": "not found on PyPI"}
+
+    def test_success_with_provenance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        urls = [sdist("pkg-2.0.tar.gz"), wheel("pkg-2.0-cp313-cp313-manylinux_x86_64.whl")]
+        monkeypatch.setattr(check_pypi_metadata, "get_pypi_info", lambda package: pypi_info("2.0", urls))
+        monkeypatch.setattr(check_pypi_metadata, "check_provenance", lambda package, version, filename: (True, None))
+
+        result = check_package("pkg")
+
+        expected: Result = {
+            "package": "pkg",
+            "notes": "",
+            "version": "2.0",
+            "trusted_publishing": True,
+            "has_provenance": True,
+            "has_sdist": True,
+            "tp_check_fn": "pkg-2.0.tar.gz",  # sdist preferred over wheel
+            "has_wheels": True,
+            "pure_python": False,
+            "latest_python_wheel": "3.13",
+            "latest_freethreaded_wheel": "missing",
+        }
+        assert result == expected
+
+    def test_trusted_publishing_is_none_without_provenance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # has_provenance=False maps to trusted_publishing=None ("n/a"), not False:
+        # it's only known False for certain once the HTML-scraping fallback runs.
+        monkeypatch.setattr(check_pypi_metadata, "get_pypi_info", lambda package: pypi_info(urls=[sdist()]))
+        monkeypatch.setattr(check_pypi_metadata, "check_provenance", lambda package, version, filename: (False, None))
+
+        result = check_package("pkg")
+
+        assert result["has_provenance"] is False
+        assert result["trusted_publishing"] is None
+
+    def test_falls_back_to_wheel_when_no_sdist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        urls = [wheel("pkg-1.0-py3-none-any.whl")]
+        monkeypatch.setattr(check_pypi_metadata, "get_pypi_info", lambda package: pypi_info(urls=urls))
+        monkeypatch.setattr(check_pypi_metadata, "check_provenance", lambda package, version, filename: (True, None))
+
+        result = check_package("pkg")
+
+        # check_provenance() is passed this same tp_check_fn value, so this
+        # also confirms it was called with the wheel filename, not an sdist.
+        assert result["tp_check_fn"] == "pkg-1.0-py3-none-any.whl"
+
+    def test_no_files_skips_provenance_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(check_pypi_metadata, "get_pypi_info", lambda package: pypi_info(urls=[]))
+
+        def fail(*args: object, **kwargs: object) -> None:
+            raise AssertionError("check_provenance should not be called when there are no files")
+
+        monkeypatch.setattr(check_pypi_metadata, "check_provenance", fail)
+
+        result = check_package("pkg")
+
+        assert result == {
+            **_FAILURE_SHAPE,
+            "package": "pkg",
+            "version": "1.0",
+            "notes": "no sdist or wheels for this release",
+        }
+
+    def test_notes_combine_wheel_and_provenance_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(check_pypi_metadata, "get_pypi_info", lambda package: pypi_info(urls=[wheel("bad.whl")]))
+        monkeypatch.setattr(
+            check_pypi_metadata, "check_provenance", lambda package, version, filename: (False, "HTTP 500")
+        )
+
+        result = check_package("pkg")
+
+        assert result["notes"] == "could not parse any wheel filename; HTTP 500"
+
+    def test_exception_resets_to_failure_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Even if version/urls were already read, an exception anywhere in the
+        # try block must discard any partial progress, not leak it into the result.
+        monkeypatch.setattr(check_pypi_metadata, "get_pypi_info", lambda package: pypi_info(urls=[sdist()]))
+
+        def boom(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("network exploded")
+
+        monkeypatch.setattr(check_pypi_metadata, "check_provenance", boom)
+
+        result = check_package("pkg")
+
+        assert result == {**_FAILURE_SHAPE, "package": "pkg", "notes": "network exploded"}

@@ -73,10 +73,12 @@ _FREETHREADED_RE = re.compile(r"(?:cp\d+|abi3)t$")
 _CP_TAG_RE = re.compile(r"^cp(\d)(\d+)$")
 # PEP 503 name normalisation: collapse runs of [-_.] to a single dash
 _NORMALISE_NAME_RE = re.compile(r"[-_.]+")
+# Matches "Uploaded using Trusted Publishing? Yes" or "No" (with optional whitespace)
+_TP_RE = re.compile(r"Uploaded using Trusted Publishing\?\s*(Yes|No)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
-# Result types
+# PyPI info parsing
 # ---------------------------------------------------------------------------
 
 
@@ -97,7 +99,7 @@ class Result(TypedDict):
 def parse_requirements(files: list[Path]) -> list[str]:
     """
     Extract sorted unique package names from one or more requirements files.
-    Exits the process if any *files* entry does not exist.
+    Exits the process if any `files` entry does not exist.
     """
     packages = set()
     for req_file in files:
@@ -166,7 +168,7 @@ def _cp_version(tag: str) -> tuple[int, int] | None:
 def _format_latest_cp_wheel(versions: list[tuple[tuple[int, int], bool]]) -> str:
     """
     Summarize a set of (version, is_stable_abi) entries for one line (regular or
-    free-threaded) as a single "latest wheel" string, or "missing" if *versions*
+    free-threaded) as a single "latest wheel" string, or "missing" if `versions`
     is empty (the line is applicable — the package isn't pure Python or an
     ABI-agnostic binary bundle — but has no wheel of its own).
 
@@ -209,7 +211,8 @@ def analyse_wheels(
       latest_freethreaded_wheel  str | None   (same as latest_python_wheel, but for
                                                 free-threaded wheels, where "+" denotes
                                                 the PEP 803 "abi3t" stable ABI instead)
-      notes                      str          (non-empty when one or more wheel filenames
+      notes                      str          (non-empty when the release has no sdist and no
+                                                wheels, or when one or more wheel filenames
                                                 could not be parsed, even if others were)
     """
     has_sdist = False
@@ -222,7 +225,8 @@ def analyse_wheels(
 
     has_wheels = bool(wheel_files)
     if not has_wheels:
-        return has_sdist, False, None, None, None, ""
+        notes = "" if has_sdist else "no sdist or wheels for this release"
+        return has_sdist, False, None, None, None, notes
 
     # A wheel is pure Python when its platform tag is "any"
     platform_tags = set()
@@ -296,7 +300,7 @@ def analyse_wheels(
     return has_sdist, True, pure_python, latest_python_wheel, latest_freethreaded_wheel, notes
 
 
-def check_provenance(package: str, version: str, sdist_filename: str) -> tuple[bool, str | None]:
+def check_provenance(package: str, version: str, filename: str) -> tuple[bool, str | None]:
     """
     Return (bool, error_str|None).
     True  = PEP 740 provenance object found (implies Trusted Publishing was used).
@@ -304,8 +308,11 @@ def check_provenance(package: str, version: str, sdist_filename: str) -> tuple[b
     Note: a package can be uploaded via Trusted Publishing (OIDC) without
     producing a PEP 740 attestation; that case is indistinguishable from a
     plain API-token upload through the public PyPI APIs.
+
+    `filename` is usually the sdist filename, or a wheel filename as a fallback
+    for packages that ship wheels only.
     """
-    url = PYPI_INTEGRITY_URL.format(package=package, version=version, filename=sdist_filename)
+    url = PYPI_INTEGRITY_URL.format(package=package, version=version, filename=filename)
     try:
         _request(url, accept="application/vnd.pypi.integrity.v1+json")
         return True, None
@@ -315,14 +322,6 @@ def check_provenance(package: str, version: str, sdist_filename: str) -> tuple[b
         return False, f"HTTP {exc.code}"
     except Exception as exc:
         return False, str(exc)
-
-
-# ---------------------------------------------------------------------------
-# HTML scraping via Playwright (fallback when has_provenance is False)
-# ---------------------------------------------------------------------------
-
-# Matches "Uploaded using Trusted Publishing? Yes" or "No" (with optional whitespace)
-_TP_RE = re.compile(r"Uploaded using Trusted Publishing\?\s*(Yes|No)", re.IGNORECASE)
 
 
 def _find_browser_executable(explicit_path: str | None) -> str | None:
@@ -340,11 +339,11 @@ class ScrapingError(Exception):
 
 def scrape_trusted_publishing(page: "Page", package: str, version: str, tp_filename: str) -> bool:
     """
-    Using an already-open Playwright *page*, navigate to the PyPI release page,
-    locate the per-file section for *tp_filename* (an sdist or wheel filename),
+    Using an already-open Playwright `page`, navigate to the PyPI release page,
+    locate the per-file section for `tp_filename` (an sdist or wheel filename),
     and return True/False for "Uploaded using Trusted Publishing?".
 
-    Raises ScrapingError if the page content cannot be retrieved (e.g., due to
+    Raises `ScrapingError` if the page content cannot be retrieved (e.g., due to
     CAPTCHA challenges or other bot-detection mechanisms).
     """
     url = PYPI_RELEASE_URL.format(package=package, version=version)
@@ -380,8 +379,13 @@ def scrape_trusted_publishing(page: "Page", package: str, version: str, tp_filen
 
 def check_package(package: str) -> Result:
     """
-    Query PyPI for *package* and return a Result dict.
-    On failure, *version* is None and *notes* contains the error message.
+    Query PyPI for `package` and return a `Result` dict.
+    On failure, `version` is None and `notes` contains the error message.
+
+    `trusted_publishing` is True if a PEP 740 provenance attestation was
+    found; otherwise it's left None here (never False) — see main()'s
+    HTML-scraping phase, which may fill it in with a definitive True/False
+    for packages that lack an attestation.
     """
     # Failure shape: only "notes" is overridden below if data is missing or an
     # exception is raised. Left untouched otherwise, so it's only ever mutated
@@ -570,6 +574,7 @@ def main(argv: list[str] | None = None) -> None:
 
     results: dict[str, Result] = {}
 
+    # --- Phase 1: concurrent PyPI JSON/Integrity API calls for all packages ---
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {executor.submit(check_package, pkg): pkg for pkg in packages}
         for done, future in enumerate(as_completed(futures), 1):
@@ -580,6 +585,12 @@ def main(argv: list[str] | None = None) -> None:
     print(file=sys.stderr)
 
     # --- Phase 2: HTML scraping for packages with has_provenance=False ---
+    # Deliberately a separate, serial pass over a single shared Playwright page
+    # rather than folded into `check_package()` (and so into Phase 1's thread
+    # pool): Playwright's sync API isn't thread-safe, so a page can't be driven
+    # from multiple concurrent worker threads. Scraping serially through one
+    # page also looks like a single browsing session rather than many parallel
+    # bots, which matters for avoiding Fastly's bot detection/CAPTCHA.
     needs_scraping: list[Result] = [
         r for r in results.values() if r["version"] is not None and r["has_provenance"] is False and r["tp_check_fn"]
     ]
