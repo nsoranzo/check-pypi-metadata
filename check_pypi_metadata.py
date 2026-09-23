@@ -73,8 +73,11 @@ _FREETHREADED_RE = re.compile(r"(?:cp\d+|abi3)t$")
 _CP_TAG_RE = re.compile(r"^cp(\d)(\d+)$")
 # PEP 503 name normalisation: collapse runs of [-_.] to a single dash
 _NORMALISE_NAME_RE = re.compile(r"[-_.]+")
-# Matches "Uploaded using Trusted Publishing? Yes" or "No" (with optional whitespace)
-_TP_RE = re.compile(r"Uploaded using Trusted Publishing\?\s*(Yes|No)", re.IGNORECASE)
+# Matches the "Uploaded using Trusted Publishing?" table row and its Yes/No
+# value cell. The label's <th> now also contains a "What is trusted
+# publishing?" help link, so the value isn't just whitespace away from the
+# "?" any more; skip forward to the closing </th> and the following <td>.
+_TP_RE = re.compile(r"Uploaded using Trusted Publishing\?.*?</th>\s*<td>\s*(Yes|No)", re.IGNORECASE | re.DOTALL)
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +372,11 @@ def scrape_trusted_publishing(page: "Page", package: str, version: str, tp_filen
         if "captcha" in html.lower() or "challenge" in html.lower():
             raise ScrapingError(f"PyPI served a CAPTCHA challenge page for {package}; " "automated scraping is blocked")
         raise ScrapingError(f"could not find file section for '{tp_filename}' in PyPI page for {package}/{version}")
-    # Take a generous slice after the section start (next ~2 KB is enough)
-    snippet = html[section_start.start() : section_start.start() + 2048]
+    # Each file's info lives in one `<table class="table table--information">`
+    # right after the id; bound the slice to it (rather than a fixed byte
+    # count) so added rows/help text can't push the target text out of range.
+    table_end = html.find("</table>", section_start.start())
+    snippet = html[section_start.start() : table_end if table_end != -1 else section_start.start() + 4096]
     m = _TP_RE.search(snippet)
     if m:
         return m.group(1).lower() == "yes"
